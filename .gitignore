@@ -1,0 +1,14 @@
+build/
+.cache/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.a
+*.log
+.idea/
+.vscode/
+data/
+*.zip
+.env
