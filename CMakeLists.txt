@@ -59,6 +59,7 @@ set(SERVER_SOURCES
     src/server.cpp
     src/connection.cpp
     src/mysql_pool.cpp
+    src/mysql_stmt.cpp
     src/redis_store.cpp
     src/auth.cpp
     src/path_guard.cpp

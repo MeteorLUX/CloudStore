@@ -90,12 +90,4 @@ bool MysqlPool::ping() {
     return mysql_ping(c.get()) == 0;
 }
 
-std::string mysqlEscape(MYSQL* mysql, const std::string& s) {
-    std::string out;
-    out.resize(s.size() * 2 + 1);
-    unsigned long n = mysql_real_escape_string(mysql, &out[0], s.c_str(), s.size());
-    out.resize(n);
-    return out;
-}
-
 }  // namespace cloud

@@ -50,6 +50,4 @@ private:
     bool stopping_ = false;
 };
 
-std::string mysqlEscape(MYSQL* mysql, const std::string& s);
-
 }  // namespace cloud

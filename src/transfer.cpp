@@ -2,6 +2,7 @@
 #include "crypto_util.h"
 #include "file_manager.h"
 #include "logger.h"
+#include "mysql_stmt.h"
 #include "path_guard.h"
 #include "utils.h"
 
@@ -12,7 +13,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <sstream>
 #include <vector>
 
 namespace cloud {
@@ -147,25 +147,21 @@ void TransferService::releaseIndexedUnderPrefix(int userId, const std::string& d
         prefix.push_back('/');
     }
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "SELECT virtual_path FROM file_index WHERE user_id=" << userId
-        << " AND is_dir=0 AND virtual_path LIKE '" << mysqlEscape(conn.get(), prefix)
-        << "%'";
-    if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
-        return;
-    }
-    MYSQL_RES* res = mysql_store_result(conn.get());
-    if (!res) {
-        return;
-    }
+    MysqlStmt stmt(conn.get(),
+                   "SELECT virtual_path FROM file_index WHERE user_id=? AND is_dir=0 AND "
+                   "virtual_path LIKE ?");
+    stmt.bindInt(1, userId);
+    stmt.bindString(2, prefix + "%");
+
+    std::string path;
+    unsigned long pathLen = 0;
+    stmt.bindResultString(1, path, pathLen);
+    stmt.execute();
+
     std::vector<std::string> paths;
-    MYSQL_ROW row;
-    while ((row = mysql_fetch_row(res))) {
-        if (row[0]) {
-            paths.emplace_back(row[0]);
-        }
+    while (stmt.fetch() == 0) {
+        paths.push_back(path);
     }
-    mysql_free_result(res);
     for (const auto& vp : paths) {
         releaseContentRef(userId, vp);
     }
@@ -180,10 +176,11 @@ void TransferService::renameIndexedFile(int userId, const std::string& fromVirtu
     indexFile(userId, toVirtual, md5, size, false, "ready");
     redis_.setPathMd5(userId, toVirtual, md5);
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "DELETE FROM file_index WHERE user_id=" << userId << " AND virtual_path='"
-        << mysqlEscape(conn.get(), fromVirtual) << "'";
-    mysql_query(conn.get(), sql.str().c_str());
+    MysqlStmt stmt(conn.get(),
+                   "DELETE FROM file_index WHERE user_id=? AND virtual_path=?");
+    stmt.bindInt(1, userId);
+    stmt.bindString(2, fromVirtual);
+    stmt.execute();
 }
 
 InstantQuery TransferService::queryInstant(const UserSession& session, const std::string& md5,
@@ -414,50 +411,67 @@ void TransferService::closeDownload(DownloadSession& st) {
 void TransferService::indexFile(int userId, const std::string& virtualPath, const std::string& md5,
                                 uint64_t size, bool isDir, const std::string& status) {
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "INSERT INTO file_index(user_id, virtual_path, md5, size, is_dir, status) VALUES("
-        << userId << ",'" << mysqlEscape(conn.get(), virtualPath) << "','"
-        << mysqlEscape(conn.get(), md5) << "'," << size << "," << (isDir ? 1 : 0) << ",'"
-        << mysqlEscape(conn.get(), status)
-        << "') ON DUPLICATE KEY UPDATE md5=VALUES(md5), size=VALUES(size), is_dir=VALUES(is_dir), "
-           "status=VALUES(status), updated_at=NOW()";
-    if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
-        throw CloudError(ErrorCode::Internal, std::string("index failed: ") + mysql_error(conn.get()));
+    MysqlStmt stmt(conn.get(),
+                   "INSERT INTO file_index(user_id, virtual_path, md5, size, is_dir, status) "
+                   "VALUES(?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE md5=VALUES(md5), "
+                   "size=VALUES(size), is_dir=VALUES(is_dir), status=VALUES(status), "
+                   "updated_at=NOW()");
+    stmt.bindInt(1, userId);
+    stmt.bindString(2, virtualPath);
+    stmt.bindString(3, md5);
+    stmt.bindUInt64(4, size);
+    stmt.bindInt(5, isDir ? 1 : 0);
+    stmt.bindString(6, status);
+    try {
+        stmt.execute();
+    } catch (const std::exception& e) {
+        throw CloudError(ErrorCode::Internal, std::string("index failed: ") + e.what());
     }
 }
 
 void TransferService::unindex(int userId, const std::string& virtualPath) {
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "DELETE FROM file_index WHERE user_id=" << userId << " AND virtual_path='"
-        << mysqlEscape(conn.get(), virtualPath) << "'";
-    mysql_query(conn.get(), sql.str().c_str());
+    MysqlStmt stmt(conn.get(), "DELETE FROM file_index WHERE user_id=? AND virtual_path=?");
+    stmt.bindInt(1, userId);
+    stmt.bindString(2, virtualPath);
+    stmt.execute();
     redis_.delPathMd5(userId, virtualPath);
 }
 
 bool TransferService::lookupFile(int userId, const std::string& virtualPath, IndexedFile& out) {
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "SELECT virtual_path, md5, size, is_dir, status FROM file_index WHERE user_id=" << userId
-        << " AND virtual_path='" << mysqlEscape(conn.get(), virtualPath) << "' LIMIT 1";
-    if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
+    MysqlStmt stmt(conn.get(),
+                   "SELECT virtual_path, md5, size, is_dir, status FROM file_index WHERE user_id=? "
+                   "AND virtual_path=? LIMIT 1");
+    stmt.bindInt(1, userId);
+    stmt.bindString(2, virtualPath);
+
+    std::string vp;
+    std::string md5;
+    uint64_t size = 0;
+    int isDir = 0;
+    std::string status;
+    unsigned long len1 = 0;
+    unsigned long len2 = 0;
+    unsigned long len3 = 0;
+    stmt.bindResultString(1, vp, len1);
+    stmt.bindResultString(2, md5, len2);
+    stmt.bindResultUInt64(3, size);
+    stmt.bindResultInt(4, isDir);
+    stmt.bindResultString(5, status, len3);
+    try {
+        stmt.execute();
+    } catch (...) {
         return false;
     }
-    MYSQL_RES* res = mysql_store_result(conn.get());
-    if (!res) {
+    if (stmt.fetch() != 0) {
         return false;
     }
-    MYSQL_ROW row = mysql_fetch_row(res);
-    if (!row) {
-        mysql_free_result(res);
-        return false;
-    }
-    out.virtualPath = row[0] ? row[0] : "";
-    out.md5 = row[1] ? row[1] : "";
-    out.size = row[2] ? std::strtoull(row[2], nullptr, 10) : 0;
-    out.isDir = row[3] && std::atoi(row[3]) != 0;
-    out.status = row[4] ? row[4] : "";
-    mysql_free_result(res);
+    out.virtualPath = vp;
+    out.md5 = md5;
+    out.size = size;
+    out.isDir = isDir != 0;
+    out.status = status;
     return true;
 }
 
@@ -478,25 +492,38 @@ std::vector<PendingFile> TransferService::listIndexed(int userId, const std::str
         prefix.push_back('/');
     }
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "SELECT virtual_path, md5, size, status FROM file_index WHERE user_id=" << userId
-        << " AND is_dir=0 AND (virtual_path='" << mysqlEscape(conn.get(), dirLogical == "/" ? "/" : dirLogical)
-        << "' OR virtual_path LIKE '" << mysqlEscape(conn.get(), prefix) << "%')";
+    const std::string exact = (dirLogical == "/" ? "/" : dirLogical);
+    MysqlStmt stmt(conn.get(),
+                   "SELECT virtual_path, md5, size, status FROM file_index WHERE user_id=? AND "
+                   "is_dir=0 AND (virtual_path=? OR virtual_path LIKE ?)");
+    stmt.bindInt(1, userId);
+    stmt.bindString(2, exact);
+    stmt.bindString(3, prefix + "%");
+
+    std::string virtualPath;
+    std::string md5;
+    uint64_t size = 0;
+    std::string status;
+    unsigned long len1 = 0;
+    unsigned long len2 = 0;
+    unsigned long len3 = 0;
+    stmt.bindResultString(1, virtualPath, len1);
+    stmt.bindResultString(2, md5, len2);
+    stmt.bindResultUInt64(3, size);
+    stmt.bindResultString(4, status, len3);
+
     std::vector<PendingFile> out;
-    if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
+    try {
+        stmt.execute();
+    } catch (...) {
         return out;
     }
-    MYSQL_RES* res = mysql_store_result(conn.get());
-    if (!res) {
-        return out;
-    }
-    MYSQL_ROW row;
-    while ((row = mysql_fetch_row(res))) {
+    while (stmt.fetch() == 0) {
         PendingFile f;
-        f.virtualPath = row[0] ? row[0] : "";
-        f.md5 = row[1] ? row[1] : "";
-        f.size = row[2] ? std::strtoull(row[2], nullptr, 10) : 0;
-        f.status = row[3] ? row[3] : "ready";
+        f.virtualPath = virtualPath;
+        f.md5 = md5;
+        f.size = size;
+        f.status = status.empty() ? "ready" : status;
         auto rest = f.virtualPath;
         if (prefix != "/" && rest.compare(0, prefix.size(), prefix) == 0) {
             rest = rest.substr(prefix.size() - 1);
@@ -511,7 +538,6 @@ std::vector<PendingFile> TransferService::listIndexed(int userId, const std::str
         }
         out.push_back(f);
     }
-    mysql_free_result(res);
     return out;
 }
 

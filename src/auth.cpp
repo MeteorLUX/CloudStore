@@ -2,10 +2,10 @@
 #include "crypto_util.h"
 #include "json_util.h"
 #include "logger.h"
+#include "mysql_stmt.h"
 #include "utils.h"
 
 #include <cstdlib>
-#include <sstream>
 
 namespace cloud {
 
@@ -34,10 +34,12 @@ void AuthService::ensureUserRoot(const std::string& username, std::string& rootD
 void AuthService::logLogin(int userId, const std::string& ip, bool ok) {
     try {
         auto conn = mysql_.acquire();
-        std::ostringstream sql;
-        sql << "INSERT INTO login_log(user_id, ip, success) VALUES(" << userId << ",'"
-            << mysqlEscape(conn.get(), ip) << "'," << (ok ? 1 : 0) << ")";
-        mysql_query(conn.get(), sql.str().c_str());
+        MysqlStmt stmt(conn.get(),
+                       "INSERT INTO login_log(user_id, ip, success) VALUES(?, ?, ?)");
+        stmt.bindInt(1, userId);
+        stmt.bindString(2, ip);
+        stmt.bindInt(3, ok ? 1 : 0);
+        stmt.execute();
     } catch (...) {
         logWarn("write login_log failed");
     }
@@ -53,19 +55,26 @@ UserSession AuthService::registerUser(const std::string& username, const std::st
     ensureUserRoot(username, rootDir);
 
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "INSERT INTO users(username, password_hash, salt, root_dir) VALUES('"
-        << mysqlEscape(conn.get(), username) << "','" << hash << "','" << salt << "','"
-        << mysqlEscape(conn.get(), rootDir) << "')";
-    if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
-        std::string err = mysql_error(conn.get());
+    uint64_t newUserId = 0;
+    try {
+        MysqlStmt stmt(conn.get(),
+                       "INSERT INTO users(username, password_hash, salt, root_dir) "
+                       "VALUES(?, ?, ?, ?)");
+        stmt.bindString(1, username);
+        stmt.bindString(2, hash);
+        stmt.bindString(3, salt);
+        stmt.bindString(4, rootDir);
+        stmt.execute();
+        newUserId = stmt.insertId();
+    } catch (const std::exception& e) {
+        std::string err = e.what();
         if (err.find("Duplicate") != std::string::npos) {
             throw CloudError(ErrorCode::Conflict, "username exists");
         }
         throw CloudError(ErrorCode::Internal, "register failed: " + err);
     }
     UserSession s;
-    s.userId = static_cast<int>(mysql_insert_id(conn.get()));
+    s.userId = static_cast<int>(newUserId);
     s.username = username;
     s.rootDir = rootDir;
     logInfo("user registered: " + username);
@@ -75,27 +84,27 @@ UserSession AuthService::registerUser(const std::string& username, const std::st
 UserSession AuthService::login(const std::string& username, const std::string& password,
                                const std::string& ip) {
     auto conn = mysql_.acquire();
-    std::ostringstream sql;
-    sql << "SELECT id, password_hash, salt, root_dir FROM users WHERE username='"
-        << mysqlEscape(conn.get(), username) << "' LIMIT 1";
-    if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
-        throw CloudError(ErrorCode::Internal, mysql_error(conn.get()));
-    }
-    MYSQL_RES* res = mysql_store_result(conn.get());
-    if (!res) {
-        throw CloudError(ErrorCode::Internal, "login query has no result");
-    }
-    MYSQL_ROW row = mysql_fetch_row(res);
-    if (!row) {
-        mysql_free_result(res);
+    MysqlStmt stmt(conn.get(),
+                   "SELECT id, password_hash, salt, root_dir FROM users WHERE username=? LIMIT 1");
+    stmt.bindString(1, username);
+
+    int uid = 0;
+    std::string hash;
+    std::string salt;
+    std::string root;
+    unsigned long hashLen = 0;
+    unsigned long saltLen = 0;
+    unsigned long rootLen = 0;
+    stmt.bindResultInt(1, uid);
+    stmt.bindResultString(2, hash, hashLen);
+    stmt.bindResultString(3, salt, saltLen);
+    stmt.bindResultString(4, root, rootLen);
+    stmt.execute();
+
+    if (stmt.fetch() != 0) {
         logLogin(0, ip, false);
         throw CloudError(ErrorCode::Unauthorized, "invalid username or password");
     }
-    int uid = std::atoi(row[0]);
-    std::string hash = row[1] ? row[1] : "";
-    std::string salt = row[2] ? row[2] : "";
-    std::string root = row[3] ? row[3] : "";
-    mysql_free_result(res);
 
     if (!verifyPassword(salt, password, hash)) {
         logLogin(uid, ip, false);
