@@ -233,30 +233,35 @@ void Connection::onList(const Json::Value& root, uint64_t seq) {
     requireLogin(seq);
     std::string path = root["data"].get("path", "/").asString();
     bool recursive = root["data"].get("recursive", false).asBool();
-    std::string phys = resolveUserPath(path, true);
-    auto entries = FileManager::listDir(phys, recursive);
-    Json::Value arr(Json::arrayValue);
-    std::unordered_map<std::string, int> seen;
-    for (const auto& e : entries) {
-        Json::Value item;
-        item["name"] = e.name;
-        item["path"] = e.path;
-        item["type"] = e.type;
-        item["size"] = static_cast<Json::UInt64>(e.size);
-        item["mtime"] = static_cast<Json::Int64>(e.mtime);
-        item["status"] = e.type == "file" ? "ready" : "ok";
-        arr.append(item);
-        seen[e.name] = 1;
-    }
     std::string logical = PathGuard::normalizeLogical(path);
     std::string dir = logical.empty() ? "/" : ("/" + logical);
+
+    Json::Value arr(Json::arrayValue);
+    std::unordered_map<std::string, int> seen;
+    try {
+        std::string phys = resolveUserPath(path, true);
+        auto entries = FileManager::listDir(phys, recursive);
+        for (const auto& e : entries) {
+            Json::Value item;
+            item["name"] = e.name;
+            item["path"] = e.path;
+            item["type"] = e.type;
+            item["size"] = static_cast<Json::UInt64>(e.size);
+            item["mtime"] = static_cast<Json::Int64>(e.mtime);
+            item["status"] = e.type == "file" ? "ready" : "ok";
+            arr.append(item);
+            seen[e.name] = 1;
+        }
+    } catch (const CloudError& e) {
+        if (e.code() != ErrorCode::NotFound) {
+            throw;
+        }
+    }
+
     auto indexed = server_->transfer().listIndexed(session_.userId, dir);
     for (const auto& f : indexed) {
         std::string name = baseName(f.virtualPath);
         if (name.empty() || seen[name]) {
-            continue;
-        }
-        if (f.status != "copying") {
             continue;
         }
         Json::Value item;
@@ -265,7 +270,7 @@ void Connection::onList(const Json::Value& root, uint64_t seq) {
         item["type"] = "file";
         item["size"] = static_cast<Json::UInt64>(f.size);
         item["mtime"] = 0;
-        item["status"] = "copying";
+        item["status"] = f.status.empty() ? "ready" : f.status;
         item["md5"] = f.md5;
         arr.append(item);
     }
@@ -303,25 +308,26 @@ void Connection::onStat(const Json::Value& root, uint64_t seq) {
     std::string logical = PathGuard::normalizeLogical(path);
     std::string vpath = logical.empty() ? "/" : ("/" + logical);
     Json::Value data;
-    try {
-        auto e = FileManager::statPath(resolveUserPath(path, true));
-        data["name"] = e.name;
-        data["type"] = e.type;
-        data["size"] = static_cast<Json::UInt64>(e.size);
-        data["mtime"] = static_cast<Json::Int64>(e.mtime);
-        data["status"] = "ready";
-    } catch (const CloudError&) {
-        auto st = server_->transfer().fileStatus(session_.userId, vpath);
-        if (st.empty()) {
-            throw;
-        }
+
+    IndexedFile indexed;
+    if (server_->transfer().lookupFile(session_.userId, vpath, indexed) && !indexed.isDir) {
         data["name"] = baseName(vpath);
         data["type"] = "file";
-        data["status"] = st;
+        data["size"] = static_cast<Json::UInt64>(indexed.size);
+        data["mtime"] = 0;
+        data["status"] = indexed.status.empty() ? "ready" : indexed.status;
+        data["md5"] = indexed.md5;
         data["readable"] = true;
-        data["note"] = (st == "copying") ? "available now (read from object store), copying into your directory"
-                                         : st;
+        sendJson(makeReply(seq, 0, "ok", data));
+        return;
     }
+
+    auto e = FileManager::statPath(resolveUserPath(path, true));
+    data["name"] = e.name;
+    data["type"] = e.type;
+    data["size"] = static_cast<Json::UInt64>(e.size);
+    data["mtime"] = static_cast<Json::Int64>(e.mtime);
+    data["status"] = e.type == "file" ? "ready" : "ok";
     sendJson(makeReply(seq, 0, "ok", data));
 }
 
@@ -331,8 +337,20 @@ void Connection::onRename(const Json::Value& root, uint64_t seq) {
     std::string to = root["data"].get("to", "").asString();
     auto fromL = PathGuard::normalizeLogical(from);
     auto toL = PathGuard::normalizeLogical(to);
-    server_->transfer().renameUserPath(session_, resolveUserPath(from, true), "/" + fromL,
-                                       resolveUserPath(to, false), "/" + toL);
+    std::string fromVirtual = "/" + fromL;
+    std::string toVirtual = "/" + toL;
+
+    std::string fromPhys;
+    try {
+        fromPhys = resolveUserPath(from, true);
+    } catch (const CloudError& e) {
+        if (e.code() != ErrorCode::NotFound) {
+            throw;
+        }
+        fromPhys = resolveUserPath(from, false);
+    }
+    server_->transfer().renameUserPath(session_, fromPhys, fromVirtual,
+                                       resolveUserPath(to, false), toVirtual);
     sendJson(makeReply(seq, 0, "ok"));
 }
 
@@ -363,8 +381,8 @@ void Connection::onInstantUpload(const Json::Value& root, uint64_t seq) {
     Json::Value data;
     data["instant"] = true;
     data["readable"] = true;
-    data["status"] = "copying";
-    data["msg"] = "file is readable now; a private copy is being written to your directory";
+    data["status"] = "ready";
+    data["msg"] = "instant upload via reference counting; content shared in object store";
     sendJson(makeReply(seq, 0, "ok", data));
 }
 

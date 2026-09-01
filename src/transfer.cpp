@@ -22,22 +22,10 @@ TransferService::TransferService(RedisStore& redis, MysqlPool& mysql, const Conf
     ensureDir(cfg_.objectsRoot());
     ensureDir(cfg_.tmpRoot());
     ensureDir(cfg_.usersRoot());
-    int n = cfg_.copyWorkers > 0 ? cfg_.copyWorkers : 1;
-    for (int i = 0; i < n; ++i) {
-        workers_.emplace_back([this] { workerLoop(); });
-    }
-    logInfo("transfer service ready, copy workers=" + std::to_string(n));
+    logInfo("transfer service ready (reference-counted object store)");
 }
 
-TransferService::~TransferService() {
-    stopping_ = true;
-    cv_.notify_all();
-    for (auto& t : workers_) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
-}
+TransferService::~TransferService() = default;
 
 std::string TransferService::objectPathFor(const std::string& md5) const {
     if (md5.size() < 2) {
@@ -46,61 +34,25 @@ std::string TransferService::objectPathFor(const std::string& md5) const {
     return joinPath(joinPath(cfg_.objectsRoot(), md5.substr(0, 2)), md5);
 }
 
-std::string TransferService::jobKey(int userId, const std::string& virtualPath) const {
-    return std::to_string(userId) + "|" + virtualPath;
-}
-
-bool TransferService::isCancelled(int userId, const std::string& virtualPath) {
-    std::lock_guard<std::mutex> lock(mu_);
-    return cancelled_.count(jobKey(userId, virtualPath)) > 0;
-}
-
-void TransferService::cancelCopy(int userId, const std::string& virtualPath) {
-    std::lock_guard<std::mutex> lock(mu_);
-    cancelled_.insert(jobKey(userId, virtualPath));
-}
-
-void TransferService::enqueueCopy(CopyJob job) {
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        cancelled_.erase(jobKey(job.userId, job.virtualPath));
-        jobs_.push(std::move(job));
+std::string TransferService::resolveObjectPath(const std::string& md5) const {
+    auto cached = redis_.getObjectPath(md5);
+    if (!cached.empty()) {
+        return cached;
     }
-    cv_.notify_one();
+    return objectPathFor(md5);
 }
 
-void TransferService::workerLoop() {
-    while (!stopping_) {
-        CopyJob job;
-        {
-            std::unique_lock<std::mutex> lock(mu_);
-            cv_.wait(lock, [&] { return stopping_ || !jobs_.empty(); });
-            if (stopping_ && jobs_.empty()) {
-                return;
-            }
-            job = std::move(jobs_.front());
-            jobs_.pop();
-        }
-        try {
-            runCopy(job);
-        } catch (const std::exception& e) {
-            logError("background copy failed " + job.virtualPath + ": " + e.what());
-        }
-    }
-}
-
-void TransferService::copyFileSlow(const std::string& src, const std::string& dest,
-                                   uint64_t expectedSize) {
+void TransferService::copyToObjectStore(const std::string& src, const std::string& dest,
+                                      uint64_t expectedSize) {
     int in = ::open(src.c_str(), O_RDONLY);
     if (in < 0) {
-        throw CloudError(ErrorCode::NotFound, "object missing during copy");
+        throw CloudError(ErrorCode::NotFound, "source missing for object publish");
     }
-    std::string tmp = dest + ".copying";
-    ensureDir(parentDir(tmp));
-    int out = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    ensureDir(parentDir(dest));
+    int out = ::open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0) {
         ::close(in);
-        throw CloudError(ErrorCode::Internal, std::string("open dest failed: ") + std::strerror(errno));
+        throw CloudError(ErrorCode::Internal, std::string("open object failed: ") + std::strerror(errno));
     }
     std::vector<char> buf(cfg_.chunkSize ? cfg_.chunkSize : 65536);
     uint64_t copied = 0;
@@ -109,8 +61,8 @@ void TransferService::copyFileSlow(const std::string& src, const std::string& de
         if (n < 0) {
             ::close(in);
             ::close(out);
-            ::unlink(tmp.c_str());
-            throw CloudError(ErrorCode::Internal, "read object failed");
+            ::unlink(dest.c_str());
+            throw CloudError(ErrorCode::Internal, "read source failed");
         }
         if (n == 0) {
             break;
@@ -121,42 +73,20 @@ void TransferService::copyFileSlow(const std::string& src, const std::string& de
             if (w < 0) {
                 ::close(in);
                 ::close(out);
-                ::unlink(tmp.c_str());
-                throw CloudError(ErrorCode::Internal, "write user copy failed");
+                ::unlink(dest.c_str());
+                throw CloudError(ErrorCode::Internal, "write object failed");
             }
             off += w;
         }
         copied += static_cast<uint64_t>(n);
-        if (cfg_.copySleepUs > 0) {
-            usleep(static_cast<useconds_t>(cfg_.copySleepUs));
-        }
     }
     ::fsync(out);
     ::close(in);
     ::close(out);
     if (expectedSize && copied != expectedSize) {
-        ::unlink(tmp.c_str());
-        throw CloudError(ErrorCode::Unprocessable, "copy size mismatch");
+        ::unlink(dest.c_str());
+        throw CloudError(ErrorCode::Unprocessable, "object size mismatch");
     }
-    if (::rename(tmp.c_str(), dest.c_str()) != 0) {
-        ::unlink(tmp.c_str());
-        throw CloudError(ErrorCode::Internal, "rename user copy failed");
-    }
-}
-
-void TransferService::runCopy(const CopyJob& job) {
-    if (isCancelled(job.userId, job.virtualPath)) {
-        logInfo("copy cancelled " + job.virtualPath);
-        return;
-    }
-    copyFileSlow(job.objectPath, job.destPath, job.size);
-    if (isCancelled(job.userId, job.virtualPath)) {
-        ::unlink(job.destPath.c_str());
-        return;
-    }
-    indexFile(job.userId, job.virtualPath, job.md5, job.size, false, "ready");
-    redis_.setPathMd5(job.userId, job.virtualPath, job.md5);
-    logInfo("background copy ready user=" + job.username + " path=" + job.virtualPath);
 }
 
 void TransferService::publishObject(const std::string& md5, const std::string& srcFile,
@@ -167,11 +97,93 @@ void TransferService::publishObject(const std::string& md5, const std::string& s
         return;
     }
     ensureDir(parentDir(obj));
-    copyFileSlow(srcFile, obj, size);
+    copyToObjectStore(srcFile, obj, size);
     if (::chmod(obj.c_str(), 0444) != 0) {
         logWarn("chmod object failed: " + obj);
     }
     redis_.setObject(md5, obj, size);
+}
+
+void TransferService::addContentRef(int userId, const std::string& virtualPath,
+                                    const std::string& md5, uint64_t size) {
+    redis_.addRef(md5, userId, virtualPath);
+    indexFile(userId, virtualPath, md5, size, false, "ready");
+    redis_.setPathMd5(userId, virtualPath, md5);
+}
+
+void TransferService::releaseContentRef(int userId, const std::string& virtualPath) {
+    std::string md5 = redis_.getPathMd5(userId, virtualPath);
+    if (md5.empty()) {
+        IndexedFile info;
+        if (lookupFile(userId, virtualPath, info) && !info.isDir) {
+            md5 = info.md5;
+        }
+    }
+    if (!md5.empty()) {
+        long long refs = redis_.removeRef(md5, userId, virtualPath);
+        if (refs <= 0) {
+            std::string obj = resolveObjectPath(md5);
+            if (fileExists(obj)) {
+                if (::chmod(obj.c_str(), 0644) != 0) {
+                    logWarn("chmod before unlink object failed: " + obj);
+                }
+                if (::unlink(obj.c_str()) != 0 && errno != ENOENT) {
+                    logWarn("unlink object failed: " + obj);
+                }
+            }
+            redis_.deleteObjectMeta(md5);
+            logInfo("object gc md5=" + md5);
+        }
+    }
+    unindex(userId, virtualPath);
+}
+
+void TransferService::releaseIndexedUnderPrefix(int userId, const std::string& dirVirtual) {
+    std::string prefix = dirVirtual;
+    if (prefix.empty() || prefix == "/") {
+        prefix = "/";
+    }
+    if (prefix.back() != '/') {
+        prefix.push_back('/');
+    }
+    auto conn = mysql_.acquire();
+    std::ostringstream sql;
+    sql << "SELECT virtual_path FROM file_index WHERE user_id=" << userId
+        << " AND is_dir=0 AND virtual_path LIKE '" << mysqlEscape(conn.get(), prefix)
+        << "%'";
+    if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
+        return;
+    }
+    MYSQL_RES* res = mysql_store_result(conn.get());
+    if (!res) {
+        return;
+    }
+    std::vector<std::string> paths;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        if (row[0]) {
+            paths.emplace_back(row[0]);
+        }
+    }
+    mysql_free_result(res);
+    for (const auto& vp : paths) {
+        releaseContentRef(userId, vp);
+    }
+}
+
+void TransferService::renameIndexedFile(int userId, const std::string& fromVirtual,
+                                        const std::string& toVirtual, const std::string& md5,
+                                        uint64_t size) {
+    redis_.removeRef(md5, userId, fromVirtual);
+    redis_.addRef(md5, userId, toVirtual);
+    redis_.delPathMd5(userId, fromVirtual);
+    indexFile(userId, toVirtual, md5, size, false, "ready");
+    redis_.setPathMd5(userId, toVirtual, md5);
+    auto conn = mysql_.acquire();
+    std::ostringstream sql;
+    sql << "DELETE FROM file_index WHERE user_id=" << userId << " AND virtual_path='"
+        << mysqlEscape(conn.get(), fromVirtual) << "'";
+    mysql_query(conn.get(), sql.str().c_str());
 }
 
 InstantQuery TransferService::queryInstant(const UserSession& session, const std::string& md5,
@@ -180,10 +192,7 @@ InstantQuery TransferService::queryInstant(const UserSession& session, const std
     if (md5.size() != 32) {
         throw CloudError(ErrorCode::BadRequest, "md5 must be 32 hex chars");
     }
-    std::string obj = redis_.getObjectPath(md5);
-    if (obj.empty()) {
-        obj = objectPathFor(md5);
-    }
+    std::string obj = resolveObjectPath(md5);
     if (!fileExists(obj) || fileSize(obj) != size) {
         q.hit = false;
         return q;
@@ -225,8 +234,8 @@ void TransferService::instantUpload(const UserSession& session, const std::strin
     if (proofOffset != expectOff) {
         throw CloudError(ErrorCode::Forbidden, "challenge offset mismatch");
     }
-    std::string obj = redis_.getObjectPath(md5);
-    if (obj.empty() || !fileExists(obj)) {
+    std::string obj = resolveObjectPath(md5);
+    if (!fileExists(obj)) {
         throw CloudError(ErrorCode::NotFound, "object not in store");
     }
     if (fileSize(obj) != size) {
@@ -240,29 +249,23 @@ void TransferService::instantUpload(const UserSession& session, const std::strin
     }
     redis_.delChallenge(session.token, md5);
 
-    if (fileExists(destPath)) {
+    IndexedFile existing;
+    bool hasExisting = lookupFile(session.userId, virtualPath, existing) && !existing.isDir;
+    if (hasExisting) {
         if (!overwrite) {
             throw CloudError(ErrorCode::Conflict, "destination exists");
         }
-        cancelCopy(session.userId, virtualPath);
+        releaseContentRef(session.userId, virtualPath);
+    } else if (fileExists(destPath)) {
+        if (!overwrite) {
+            throw CloudError(ErrorCode::Conflict, "destination exists");
+        }
         ::unlink(destPath.c_str());
-        unindex(session.userId, virtualPath);
     }
 
     ensureDir(parentDir(destPath));
-    indexFile(session.userId, virtualPath, md5, size, false, "copying");
-    redis_.setPathMd5(session.userId, virtualPath, md5);
-
-    CopyJob job;
-    job.userId = session.userId;
-    job.username = session.username;
-    job.md5 = md5;
-    job.objectPath = obj;
-    job.destPath = destPath;
-    job.virtualPath = virtualPath;
-    job.size = size;
-    enqueueCopy(std::move(job));
-    logInfo("instant upload accepted, background copy queued path=" + virtualPath);
+    addContentRef(session.userId, virtualPath, md5, size);
+    logInfo("instant upload ref added path=" + virtualPath + " md5=" + md5);
 }
 
 UploadSession TransferService::beginUpload(const UserSession& session, const std::string& destPath,
@@ -276,6 +279,7 @@ UploadSession TransferService::beginUpload(const UserSession& session, const std
     }
     std::string tmpDir = joinPath(cfg_.tmpRoot(), session.username);
     ensureDir(tmpDir);
+    ensureDir(parentDir(destPath));
     UploadSession st;
     st.fileId = randomHex(16);
     st.destPath = destPath;
@@ -283,7 +287,6 @@ UploadSession TransferService::beginUpload(const UserSession& session, const std
     st.md5 = md5;
     st.totalSize = size;
     st.partPath = joinPath(tmpDir, md5 + "_" + baseName(destPath) + ".part");
-    ensureDir(parentDir(destPath));
 
     int flags = O_RDWR | O_CREAT;
     st.fd = ::open(st.partPath.c_str(), flags, 0644);
@@ -337,11 +340,16 @@ void TransferService::finishUpload(const UserSession& session, UploadSession& st
         throw CloudError(ErrorCode::Unprocessable, "md5 mismatch, transfer corrupted");
     }
 
+    IndexedFile existing;
+    if (lookupFile(session.userId, st.virtualPath, existing) && !existing.isDir) {
+        releaseContentRef(session.userId, st.virtualPath);
+    } else if (fileExists(st.destPath)) {
+        ::unlink(st.destPath.c_str());
+    }
+
     publishObject(st.md5, st.partPath, st.totalSize);
-    copyFileSlow(st.partPath, st.destPath, st.totalSize);
     ::unlink(st.partPath.c_str());
-    indexFile(session.userId, st.virtualPath, st.md5, st.totalSize, false, "ready");
-    redis_.setPathMd5(session.userId, st.virtualPath, st.md5);
+    addContentRef(session.userId, st.virtualPath, st.md5, st.totalSize);
     logInfo("upload complete path=" + st.virtualPath + " md5=" + st.md5);
 }
 
@@ -355,23 +363,20 @@ void TransferService::closeUpload(UploadSession& st) {
 DownloadSession TransferService::beginDownload(const UserSession& session,
                                                const std::string& physical,
                                                const std::string& virtualPath) {
+    (void)physical;
     DownloadSession d;
     d.fileId = randomHex(16);
-    std::string status = fileStatus(session.userId, virtualPath);
-    std::string src = physical;
-    if (status == "copying" || !fileExists(physical)) {
-        std::string md5 = redis_.getPathMd5(session.userId, virtualPath);
-        if (md5.empty()) {
+    std::string md5 = redis_.getPathMd5(session.userId, virtualPath);
+    if (md5.empty()) {
+        IndexedFile info;
+        if (!lookupFile(session.userId, virtualPath, info) || info.isDir || info.md5.empty()) {
             throw CloudError(ErrorCode::NotFound, "file not found");
         }
-        src = objectPathFor(md5);
-        auto cached = redis_.getObjectPath(md5);
-        if (!cached.empty()) {
-            src = cached;
-        }
-        if (!fileExists(src)) {
-            throw CloudError(ErrorCode::NotFound, "object missing, file not readable yet");
-        }
+        md5 = info.md5;
+    }
+    std::string src = resolveObjectPath(md5);
+    if (!fileExists(src)) {
+        throw CloudError(ErrorCode::NotFound, "object missing");
     }
     d.srcPath = src;
     d.totalSize = fileSize(src);
@@ -430,22 +435,38 @@ void TransferService::unindex(int userId, const std::string& virtualPath) {
     redis_.delPathMd5(userId, virtualPath);
 }
 
-std::string TransferService::fileStatus(int userId, const std::string& virtualPath) {
+bool TransferService::lookupFile(int userId, const std::string& virtualPath, IndexedFile& out) {
     auto conn = mysql_.acquire();
     std::ostringstream sql;
-    sql << "SELECT status FROM file_index WHERE user_id=" << userId << " AND virtual_path='"
-        << mysqlEscape(conn.get(), virtualPath) << "' LIMIT 1";
+    sql << "SELECT virtual_path, md5, size, is_dir, status FROM file_index WHERE user_id=" << userId
+        << " AND virtual_path='" << mysqlEscape(conn.get(), virtualPath) << "' LIMIT 1";
     if (mysql_query(conn.get(), sql.str().c_str()) != 0) {
-        return "";
+        return false;
     }
     MYSQL_RES* res = mysql_store_result(conn.get());
     if (!res) {
-        return "";
+        return false;
     }
     MYSQL_ROW row = mysql_fetch_row(res);
-    std::string st = (row && row[0]) ? row[0] : "";
+    if (!row) {
+        mysql_free_result(res);
+        return false;
+    }
+    out.virtualPath = row[0] ? row[0] : "";
+    out.md5 = row[1] ? row[1] : "";
+    out.size = row[2] ? std::strtoull(row[2], nullptr, 10) : 0;
+    out.isDir = row[3] && std::atoi(row[3]) != 0;
+    out.status = row[4] ? row[4] : "";
     mysql_free_result(res);
-    return st;
+    return true;
+}
+
+std::string TransferService::fileStatus(int userId, const std::string& virtualPath) {
+    IndexedFile info;
+    if (!lookupFile(userId, virtualPath, info)) {
+        return "";
+    }
+    return info.status;
 }
 
 std::vector<PendingFile> TransferService::listIndexed(int userId, const std::string& dirLogical) {
@@ -475,11 +496,10 @@ std::vector<PendingFile> TransferService::listIndexed(int userId, const std::str
         f.virtualPath = row[0] ? row[0] : "";
         f.md5 = row[1] ? row[1] : "";
         f.size = row[2] ? std::strtoull(row[2], nullptr, 10) : 0;
-        f.status = row[3] ? row[3] : "";
-        // 仅返回当前目录这一层（秒传尚未落盘的 copying 项需要显示）
+        f.status = row[3] ? row[3] : "ready";
         auto rest = f.virtualPath;
         if (prefix != "/" && rest.compare(0, prefix.size(), prefix) == 0) {
-            rest = rest.substr(prefix.size() - 1);  // keep leading /
+            rest = rest.substr(prefix.size() - 1);
             if (!rest.empty() && rest[0] == '/') {
                 rest = rest.substr(1);
             }
@@ -497,41 +517,43 @@ std::vector<PendingFile> TransferService::listIndexed(int userId, const std::str
 
 void TransferService::removeUserPath(const UserSession& session, const std::string& physical,
                                      const std::string& virtualPath) {
+    IndexedFile indexed;
+    if (lookupFile(session.userId, virtualPath, indexed) && !indexed.isDir) {
+        releaseContentRef(session.userId, virtualPath);
+        if (fileExists(physical)) {
+            ::unlink(physical.c_str());
+        }
+        return;
+    }
+
     struct stat st {};
     bool exists = lstat(physical.c_str(), &st) == 0;
     if (exists && S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
-        auto kids = FileManager::listDir(physical, true);
-        for (const auto& e : kids) {
-            if (e.type == "file") {
-                std::string v = virtualPath == "/" ? e.path : (virtualPath + e.path);
-                // e.path already like /name/...
-                cancelCopy(session.userId, e.path);
-                unindex(session.userId, e.path);
-            }
-        }
+        releaseIndexedUnderPrefix(session.userId, virtualPath);
         FileManager::removePath(physical);
         unindex(session.userId, virtualPath);
         return;
     }
-    cancelCopy(session.userId, virtualPath);
+
     if (exists) {
         if (::unlink(physical.c_str()) != 0 && errno != ENOENT) {
             throw CloudError(ErrorCode::Internal, std::string("unlink failed: ") + std::strerror(errno));
         }
-        ::unlink((physical + ".copying").c_str());
     }
-    unindex(session.userId, virtualPath);
+    releaseContentRef(session.userId, virtualPath);
 }
 
 void TransferService::renameUserPath(const UserSession& session, const std::string& fromPhysical,
                                      const std::string& fromVirtual, const std::string& toPhysical,
                                      const std::string& toVirtual) {
-    if (fileStatus(session.userId, fromVirtual) == "copying") {
-        throw CloudError(ErrorCode::Conflict, "file is still being copied into your directory");
+    IndexedFile info;
+    if (lookupFile(session.userId, fromVirtual, info) && !info.isDir) {
+        renameIndexedFile(session.userId, fromVirtual, toVirtual, info.md5, info.size);
+        return;
     }
     FileManager::renamePath(fromPhysical, toPhysical);
     auto md5 = redis_.getPathMd5(session.userId, fromVirtual);
-    auto sz = fileSize(toPhysical);
+    uint64_t sz = fileExists(toPhysical) ? fileSize(toPhysical) : 0;
     unindex(session.userId, fromVirtual);
     indexFile(session.userId, toVirtual, md5, sz, false, "ready");
     if (!md5.empty()) {

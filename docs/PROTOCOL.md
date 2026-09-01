@@ -31,16 +31,16 @@ payload[length]
 | register | username, password | 注册并创建用户根目录 |
 | login | username, password | 返回 token |
 | logout | | 删除 Redis 会话 |
-| ls | path, recursive | 目录遍历；秒传拷贝中的文件 `status=copying` 仍可见 |
+| ls | path, recursive | 目录遍历；索引中的文件（仅存于 objects/）与物理目录项合并展示 |
 | mkdir | path | 创建目录 |
 | rm | path | 删除文件或递归目录 |
-| stat | path | 类型/大小；拷贝中的文件仍可查询 |
-| rename | from, to | 重命名（拷贝中禁止） |
+| stat | path | 类型/大小；索引文件从 file_index 返回 |
+| rename | from, to | 重命名；索引文件仅更新元数据 |
 | instant_query | md5, size | 是否可秒传，并下发切片挑战 |
-| instant_upload | path, md5, size, challenge_offset, proof_md5, overwrite | 证明持有后立刻可读 |
+| instant_upload | path, md5, size, challenge_offset, proof_md5, overwrite | 证明持有后 addRef，立刻可读 |
 | upload_begin | path, md5, size | 返回 file_id、已有 offset（断点续传） |
-| upload_end | | 校验 MD5，写入对象库和用户目录 |
-| download_begin | path | 返回 file_id、size。秒传拷贝中则从对象库只读 |
+| upload_end | | 校验 MD5，发布到对象库并 addRef |
+| download_begin | path | 返回 file_id、size；从 objects/ 只读 |
 | download_chunk | file_id, offset, length | 成功时服务器回 **二进制分块帧**；结束时回 JSON `eof` |
 
 ## 分块帧 payload

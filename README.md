@@ -1,7 +1,7 @@
 # CloudStore — Linux C++ 高性能云存储（服务端 + 客户端）
 
 针对多用户文件云存储场景的完整系统：**一个服务端 `cloud_server`，一个客户端 `cloud_client`**。  
-覆盖并发接入、分块传输、断点续传、路径越权防护、MD5 完整性校验与秒传。
+覆盖并发接入、分块传输、断点续传、路径越权防护、MD5 完整性校验与**引用计数秒传**。
 
 项目周期：2025.09 – 2025.10
 
@@ -9,32 +9,31 @@
 
 | 程序 | 职责 |
 | --- | --- |
-| `cloud_server` | Libevent 单线程非阻塞接入；MySQL 鉴权；Redis 会话/对象索引；Linux 文件 API；秒传后台拷贝 |
+| `cloud_server` | Libevent 单线程非阻塞接入；MySQL 鉴权；Redis 会话/对象索引/引用计数；Linux 文件 API |
 | `cloud_client` | 登录/注册、目录操作、`put`/`get`。上传时**只读本地文件**算 MD5 和切片证明，命中则秒传 |
 
 ```text
 cloud_client  --TCP 9000-->  cloud_server
-                                |-- MySQL   用户 / 文件索引
-                                |-- Redis   会话、对象 MD5、秒传挑战
-                                |-- objects/  全局只读对象库（秒传来源）
-                                `-- users/<name>/  每个用户自己的独立副本
+                                |-- MySQL   用户 / 文件索引 (virtual_path -> md5)
+                                |-- Redis   会话、对象元数据、cs:refs:<md5> 引用计数
+                                |-- objects/  全局只读对象库（相同内容只存一份）
+                                `-- users/<name>/  用户目录树（目录结构；文件内容在 objects/）
 ```
 
-## 秒传怎么工作
+## 秒传怎么工作（引用计数）
 
-1. **客户端只读本地文件**：计算整文件 MD5，并按服务端下发的偏移再读一小段做持有证明。  
-   网络上不传文件体。
-2. **立刻可读**：服务端确认对象库里已有相同内容后，立刻在文件索引中登记。此时 `ls` / `stat` / `get` 都可以用，下载从**全局对象库只读**。
-3. **后台再写入本用户目录**：工作线程把对象库中的内容**拷贝**成当前用户目录下的独立普通文件。拷贝完成后，该用户拥有自己的副本，与其他用户互不影响；对方删除自己的文件不会让你丢数据。
-
+1. **客户端只读本地文件**：计算整文件 MD5，并按服务端下发的偏移再读一小段做持有证明。网络上不传文件体。
+2. **命中后 addRef**：服务端在 `file_index` 登记 `user_id + virtual_path -> md5`，Redis `SADD cs:refs:<md5>`，**不拷贝物理文件**。
+3. **多用户共享**：A、B 上传相同内容时，`objects/<md5>` 只有一份；各自逻辑路径独立，删除时 `removeRef`，引用为 0 才 GC 对象。
+4. **立刻可读**：`ls` / `stat` / `get` 通过索引查 md5，从 `objects/` 只读下载。
 
 ## 功能对照
 
-1. **通信框架**：Libevent + `bufferevent`，非阻塞 I/O 多路复用，单事件线程处理大量连接。  
-2. **混合协议**：JSON 控制面（登录、权限、目录）；二进制分块传输面（上传/下载）。  
-3. **多租户安全**：MySQL 鉴权；`PathGuard` 把逻辑路径映射到用户根目录，拒绝 `..`、符号链接逃逸、跨用户路径。  
-4. **文件管理**：`lstat` / `opendir` / `mkdir` / `rename` / `unlink`，递归遍历、类型识别、断点续传（`.part`）、资源关闭。  
-5. **校验与秒传**：MD5 + 路径写入 Redis/MySQL；收发 MD5 比对保证完整性；秒传带随机切片证明，避免只靠哈希撞库。
+1. **通信框架**：Libevent + `bufferevent`，非阻塞 I/O 多路复用，单事件线程处理大量连接。
+2. **混合协议**：JSON 控制面（登录、权限、目录）；二进制分块传输面（上传/下载）。
+3. **多租户安全**：MySQL 鉴权；`PathGuard` 把逻辑路径映射到用户根目录，拒绝 `..`、符号链接逃逸、跨用户路径。
+4. **文件管理**：`lstat` / `opendir` / `mkdir` / `rename` / `unlink`，递归遍历、类型识别、断点续传（`.part`）、资源关闭。
+5. **校验与秒传**：MD5 + 路径写入 Redis/MySQL；收发 MD5 比对保证完整性；秒传带随机切片证明；**引用计数去重省磁盘**。
 
 ## 依赖（Ubuntu 22.04）
 
@@ -97,7 +96,7 @@ alice> rm /docs/movie.mp4
     put ./movie.mp4 /docs/movie.mp4
 ```
 
-`put` 流程：读本地文件 → `instant_query` → 命中则 `instant_upload`（秒传）；否则 `upload_begin` 分块上传（按服务端返回的 `offset` 断点续传）→ `upload_end` 校验 MD5。
+`put` 流程：读本地文件 → `instant_query` → 命中则 `instant_upload`（秒传，addRef）；否则 `upload_begin` 分块上传（按服务端返回的 `offset` 断点续传）→ `upload_end` 校验 MD5 并发布到对象库。
 
 ## 目录结构
 

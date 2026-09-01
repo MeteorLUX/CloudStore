@@ -5,14 +5,8 @@
 #include "mysql_pool.h"
 #include "redis_store.h"
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
-#include <queue>
 #include <string>
-#include <thread>
-#include <unordered_set>
 #include <vector>
 
 namespace cloud {
@@ -46,21 +40,19 @@ struct PendingFile {
     std::string virtualPath;
     std::string md5;
     uint64_t size = 0;
-    std::string status;  // copying / ready
+    std::string status;  // ready
 };
 
-struct CopyJob {
-    int userId = 0;
-    std::string username;
-    std::string md5;
-    std::string objectPath;
-    std::string destPath;
+struct IndexedFile {
     std::string virtualPath;
+    std::string md5;
     uint64_t size = 0;
+    bool isDir = false;
+    std::string status;
 };
 
-// 秒传：客户端只读本地文件做 MD5 / 切片证明，不传文件体。
-// 命中后立刻可下载（从全局对象库只读），再由后台线程把独立副本拷进当前用户目录。
+// 秒传与上传均采用引用计数：相同内容在 objects/ 只存一份，
+// file_index 记录 user_id + virtual_path -> md5，Redis SCARD 维护引用数。
 class TransferService {
 public:
     TransferService(RedisStore& redis, MysqlPool& mysql, const Config& cfg);
@@ -94,6 +86,7 @@ public:
 
     std::vector<PendingFile> listIndexed(int userId, const std::string& dirLogical);
     std::string fileStatus(int userId, const std::string& virtualPath);
+    bool lookupFile(int userId, const std::string& virtualPath, IndexedFile& out);
 
     void indexFile(int userId, const std::string& virtualPath, const std::string& md5,
                    uint64_t size, bool isDir, const std::string& status);
@@ -101,24 +94,18 @@ public:
 
 private:
     void publishObject(const std::string& md5, const std::string& srcFile, uint64_t size);
-    void enqueueCopy(CopyJob job);
-    void workerLoop();
-    void runCopy(const CopyJob& job);
-    void copyFileSlow(const std::string& src, const std::string& dest, uint64_t expectedSize);
-    bool isCancelled(int userId, const std::string& virtualPath);
-    void cancelCopy(int userId, const std::string& virtualPath);
-    std::string jobKey(int userId, const std::string& virtualPath) const;
+    void copyToObjectStore(const std::string& src, const std::string& dest, uint64_t expectedSize);
+    void addContentRef(int userId, const std::string& virtualPath, const std::string& md5,
+                       uint64_t size);
+    void releaseContentRef(int userId, const std::string& virtualPath);
+    std::string resolveObjectPath(const std::string& md5) const;
+    void releaseIndexedUnderPrefix(int userId, const std::string& dirVirtual);
+    void renameIndexedFile(int userId, const std::string& fromVirtual,
+                           const std::string& toVirtual, const std::string& md5, uint64_t size);
 
     RedisStore& redis_;
     MysqlPool& mysql_;
     Config cfg_;
-
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::queue<CopyJob> jobs_;
-    std::unordered_set<std::string> cancelled_;
-    std::vector<std::thread> workers_;
-    std::atomic<bool> stopping_{false};
 };
 
 }  // namespace cloud
