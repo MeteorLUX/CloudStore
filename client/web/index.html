@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CloudStore</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">CS</div>
+        <div>
+          <h1>CloudStore</h1>
+          <p>云存储客户端</p>
+        </div>
+      </div>
+      <div class="panel" id="loginPanel">
+        <h2>连接与登录</h2>
+        <label>服务端地址<input id="host" value="127.0.0.1" /></label>
+        <label>端口<input id="port" type="number" value="9000" /></label>
+        <label>用户名<input id="username" placeholder="alice" /></label>
+        <label>密码<input id="password" type="password" placeholder="alice123" /></label>
+        <div class="btn-row">
+          <button id="btnConnect" class="btn secondary">连接</button>
+          <button id="btnLogin" class="btn primary">登录</button>
+          <button id="btnRegister" class="btn ghost">注册</button>
+        </div>
+      </div>
+      <div class="panel hidden" id="userPanel">
+        <h2>当前用户</h2>
+        <div class="user-card">
+          <div class="avatar" id="avatar">A</div>
+          <div>
+            <div class="user-name" id="userName">alice</div>
+            <div class="user-host" id="userHost">127.0.0.1:9000</div>
+          </div>
+        </div>
+        <button id="btnLogout" class="btn ghost full">退出登录</button>
+      </div>
+      <div class="panel">
+        <h2>操作</h2>
+        <button id="btnMkdir" class="btn secondary full" disabled>新建文件夹</button>
+        <label class="upload-btn btn primary full" id="uploadLabel">
+          上传文件
+          <input type="file" id="fileInput" hidden disabled />
+        </label>
+      </div>
+      <div class="progress-panel hidden" id="progressPanel">
+        <div class="progress-label" id="progressLabel">上传中...</div>
+        <div class="progress-bar"><div id="progressFill"></div></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="toolbar">
+        <div class="breadcrumb" id="breadcrumb"></div>
+        <div class="toolbar-actions">
+          <button id="btnRefresh" class="btn icon" title="刷新" disabled>↻</button>
+        </div>
+      </header>
+      <section class="file-list" id="fileList">
+        <div class="empty">请先连接并登录</div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

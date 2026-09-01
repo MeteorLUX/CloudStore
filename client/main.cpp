@@ -50,8 +50,10 @@ static void runShell(cloud::CloudClient& c) {
             }
             if (cmd == "login" && t.size() >= 3) {
                 c.login(t[1], t[2]);
+                std::cout << "login ok, user=" << c.username() << "\n";
             } else if (cmd == "register" && t.size() >= 3) {
                 c.signup(t[1], t[2]);
+                std::cout << "register ok, please login\n";
             } else if (cmd == "logout") {
                 c.logout();
             } else if (cmd == "ls") {

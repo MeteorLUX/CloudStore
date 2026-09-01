@@ -4,9 +4,12 @@
 #include "protocol.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace cloud {
+
+using ProgressCallback = std::function<void(uint64_t current, uint64_t total, const std::string& phase)>;
 
 class CloudClient {
 public:
@@ -15,26 +18,38 @@ public:
 
     void connectTo(const std::string& host, uint16_t port);
     void close();
+    bool connected() const { return fd_ >= 0; }
+
+    void setProgressCallback(ProgressCallback cb) { progress_ = std::move(cb); }
 
     Json::Value request(const std::string& cmd, const Json::Value& data = Json::Value());
-    void login(const std::string& user, const std::string& pass);
-    void signup(const std::string& user, const std::string& pass);
+    Json::Value login(const std::string& user, const std::string& pass);
+    Json::Value signup(const std::string& user, const std::string& pass);
     void logout();
 
+    Json::Value listEntries(const std::string& path, bool recursive = false);
+    Json::Value makeDir(const std::string& path);
+    Json::Value removePath(const std::string& path);
+    Json::Value statPath(const std::string& path);
+    Json::Value renamePath(const std::string& from, const std::string& to);
+
+    Json::Value put(const std::string& localPath, const std::string& remotePath, bool overwrite = false);
+    Json::Value get(const std::string& remotePath, const std::string& localPath);
+
+    // CLI helpers (print to stdout)
     void ls(const std::string& path, bool recursive = false);
     void mkdir(const std::string& path);
     void rm(const std::string& path);
     void stat(const std::string& path);
     void rename(const std::string& from, const std::string& to);
 
-    // 先读本地文件算 MD5；命中则秒传（立刻可下载），否则分块上传（支持断点续传）
-    void put(const std::string& localPath, const std::string& remotePath, bool overwrite = false);
-    void get(const std::string& remotePath, const std::string& localPath);
-
     bool loggedIn() const { return !token_.empty(); }
     const std::string& username() const { return username_; }
+    const std::string& host() const { return host_; }
+    uint16_t port() const { return port_; }
 
 private:
+    void reportProgress(uint64_t current, uint64_t total, const std::string& phase);
     void sendFrame(FrameType type, const std::string& payload);
     Frame recvFrame();
     Json::Value recvJson();
@@ -48,6 +63,7 @@ private:
     std::string username_;
     std::string host_;
     uint16_t port_ = 0;
+    ProgressCallback progress_;
 };
 
 }  // namespace cloud

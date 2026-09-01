@@ -48,7 +48,7 @@ sudo apt-get install -y g++ cmake pkg-config \
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-# 得到：build/cloud_server   build/cloud_client
+# 得到：build/cloud_server   build/cloud_client   build/cloud_gui（可选）
 ```
 
 或：`bash scripts/build.sh`
@@ -97,6 +97,18 @@ alice> rm /docs/movie.mp4
 ```
 
 `put` 流程：读本地文件 → `instant_query` → 命中则 `instant_upload`（秒传，addRef）；否则 `upload_begin` 分块上传（按服务端返回的 `offset` 断点续传）→ `upload_end` 校验 MD5 并发布到对象库。
+
+## Web 图形界面
+
+编译时默认构建 `cloud_gui`（`-DBUILD_GUI=OFF` 可关闭）。在项目根目录启动：
+
+```bash
+./build/cloud_gui --host 127.0.0.1 --port 9000 --listen 9080
+```
+
+浏览器打开 **http://127.0.0.1:9080**，可登录、浏览目录、上传/下载、新建文件夹、删除文件。界面文件位于 `client/web/`。
+
+默认测试账号：`alice` / `alice123`
 
 ## 目录结构
 

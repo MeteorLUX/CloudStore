@@ -92,5 +92,28 @@ target_link_libraries(cloud_client
         Threads::Threads
 )
 
+option(BUILD_GUI "Build web GUI (cloud_gui)" ON)
+if(BUILD_GUI)
+    set(GUI_SOURCES
+        client/gui_main.cpp
+        client/client.cpp
+    )
+    add_executable(cloud_gui ${GUI_SOURCES})
+    target_include_directories(cloud_gui PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/client
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    )
+    target_compile_definitions(cloud_gui PRIVATE CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=0)
+    target_link_libraries(cloud_gui
+        PRIVATE
+            cloud_common
+            Threads::Threads
+    )
+    install(DIRECTORY client/web DESTINATION share/cloudstore)
+endif()
+
 install(TARGETS cloud_server cloud_client RUNTIME DESTINATION bin)
+if(BUILD_GUI)
+    install(TARGETS cloud_gui RUNTIME DESTINATION bin)
+endif()
 install(FILES conf/server.conf DESTINATION etc/cloudstore)

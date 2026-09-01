@@ -1,6 +1,5 @@
 #include "client.h"
 #include "crypto_util.h"
-#include "logger.h"
 #include "utils.h"
 
 #include <arpa/inet.h>
@@ -25,6 +24,12 @@ void CloudClient::close() {
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
+    }
+}
+
+void CloudClient::reportProgress(uint64_t current, uint64_t total, const std::string& phase) {
+    if (progress_) {
+        progress_(current, total, phase);
     }
 }
 
@@ -77,6 +82,8 @@ void CloudClient::connectTo(const std::string& host, uint16_t port) {
     }
     host_ = host;
     port_ = port;
+    token_.clear();
+    username_.clear();
 }
 
 void CloudClient::sendFrame(FrameType type, const std::string& payload) {
@@ -139,82 +146,71 @@ Json::Value CloudClient::request(const std::string& cmd, const Json::Value& data
     return reply;
 }
 
-void CloudClient::login(const std::string& user, const std::string& pass) {
+Json::Value CloudClient::login(const std::string& user, const std::string& pass) {
     Json::Value d;
     d["username"] = user;
     d["password"] = pass;
     auto r = request("login", d);
     token_ = r["data"]["token"].asString();
     username_ = r["data"]["username"].asString();
-    std::cout << "login ok, user=" << username_ << "\n";
+    return r["data"];
 }
 
-void CloudClient::signup(const std::string& user, const std::string& pass) {
+Json::Value CloudClient::signup(const std::string& user, const std::string& pass) {
     Json::Value d;
     d["username"] = user;
     d["password"] = pass;
-    request("register", d);
-    std::cout << "register ok, please login\n";
+    return request("register", d)["data"];
 }
 
 void CloudClient::logout() {
-    request("logout");
+    if (!token_.empty()) {
+        request("logout");
+    }
     token_.clear();
     username_.clear();
-    std::cout << "logout ok\n";
 }
 
-void CloudClient::ls(const std::string& path, bool recursive) {
+Json::Value CloudClient::listEntries(const std::string& path, bool recursive) {
     Json::Value d;
     d["path"] = path;
     d["recursive"] = recursive;
-    auto r = request("ls", d);
-    const auto& arr = r["data"]["entries"];
-    std::cout << "path: " << r["data"]["path"].asString() << "\n";
-    for (const auto& e : arr) {
-        std::cout << "  " << e.get("type", "").asString() << "\t"
-                  << e.get("size", 0).asUInt64() << "\t" << e.get("status", "").asString() << "\t"
-                  << e.get("path", e.get("name", "")).asString() << "\n";
-    }
+    return request("ls", d)["data"];
 }
 
-void CloudClient::mkdir(const std::string& path) {
+Json::Value CloudClient::makeDir(const std::string& path) {
     Json::Value d;
     d["path"] = path;
-    request("mkdir", d);
-    std::cout << "mkdir ok\n";
+    return request("mkdir", d)["data"];
 }
 
-void CloudClient::rm(const std::string& path) {
+Json::Value CloudClient::removePath(const std::string& path) {
     Json::Value d;
     d["path"] = path;
-    request("rm", d);
-    std::cout << "rm ok\n";
+    return request("rm", d)["data"];
 }
 
-void CloudClient::stat(const std::string& path) {
+Json::Value CloudClient::statPath(const std::string& path) {
     Json::Value d;
     d["path"] = path;
-    auto r = request("stat", d);
-    std::cout << dumpJson(r["data"]) << "\n";
+    return request("stat", d)["data"];
 }
 
-void CloudClient::rename(const std::string& from, const std::string& to) {
+Json::Value CloudClient::renamePath(const std::string& from, const std::string& to) {
     Json::Value d;
     d["from"] = from;
     d["to"] = to;
-    request("rename", d);
-    std::cout << "rename ok\n";
+    return request("rename", d)["data"];
 }
 
-void CloudClient::put(const std::string& localPath, const std::string& remotePath, bool overwrite) {
+Json::Value CloudClient::put(const std::string& localPath, const std::string& remotePath,
+                             bool overwrite) {
     if (!fileExists(localPath)) {
         throw std::runtime_error("local file not found: " + localPath);
     }
     uint64_t size = fileSize(localPath);
-    std::cout << "reading local file to compute md5 ...\n";
+    reportProgress(0, size, "hashing");
     std::string md5 = md5File(localPath);
-    std::cout << "md5=" << md5 << " size=" << size << "\n";
 
     Json::Value q;
     q["md5"] = md5;
@@ -233,9 +229,13 @@ void CloudClient::put(const std::string& localPath, const std::string& remotePat
         up["proof_md5"] = proof;
         up["overwrite"] = overwrite;
         auto ir = request("instant_upload", up);
-        std::cout << "秒传成功：文件已可立即下载；服务端正在后台把独立副本写入你的目录\n";
-        std::cout << dumpJson(ir["data"]) << "\n";
-        return;
+        reportProgress(size, size, "instant");
+        Json::Value result;
+        result["mode"] = "instant";
+        result["md5"] = md5;
+        result["size"] = static_cast<Json::UInt64>(size);
+        result["detail"] = ir["data"];
+        return result;
     }
 
     Json::Value b;
@@ -246,9 +246,6 @@ void CloudClient::put(const std::string& localPath, const std::string& remotePat
     std::string fileId = br["data"]["file_id"].asString();
     uint64_t offset = br["data"]["offset"].asUInt64();
     uint32_t chunk = br["data"].get("chunk_size", 65536).asUInt();
-    if (offset) {
-        std::cout << "resume from offset " << offset << "\n";
-    }
 
     std::ifstream in(localPath, std::ios::binary);
     in.seekg(static_cast<std::streamoff>(offset));
@@ -263,16 +260,18 @@ void CloudClient::put(const std::string& localPath, const std::string& remotePat
         }
         sendChunk(fileId, sent, buf.data(), n);
         sent += n;
-        if (sent % (chunk * 32) == 0 || sent == size) {
-            std::cout << "\rupload " << sent << "/" << size << std::flush;
-        }
+        reportProgress(sent, size, "uploading");
     }
-    std::cout << "\n";
     request("upload_end");
-    std::cout << "upload complete, md5 verified\n";
+    reportProgress(size, size, "done");
+    Json::Value result;
+    result["mode"] = "upload";
+    result["md5"] = md5;
+    result["size"] = static_cast<Json::UInt64>(size);
+    return result;
 }
 
-void CloudClient::get(const std::string& remotePath, const std::string& localPath) {
+Json::Value CloudClient::get(const std::string& remotePath, const std::string& localPath) {
     Json::Value d;
     d["path"] = remotePath;
     auto br = request("download_begin", d);
@@ -311,9 +310,42 @@ void CloudClient::get(const std::string& remotePath, const std::string& localPat
         }
         out.write(cp.data.data(), static_cast<std::streamsize>(cp.data.size()));
         got += cp.data.size();
-        std::cout << "\rdownload " << got << "/" << size << std::flush;
+        reportProgress(got, size, "downloading");
     }
-    std::cout << "\nsaved to " << localPath << "\n";
+    Json::Value result;
+    result["path"] = remotePath;
+    result["local"] = localPath;
+    result["size"] = static_cast<Json::UInt64>(got);
+    return result;
+}
+
+void CloudClient::ls(const std::string& path, bool recursive) {
+    auto data = listEntries(path, recursive);
+    std::cout << "path: " << data["path"].asString() << "\n";
+    for (const auto& e : data["entries"]) {
+        std::cout << "  " << e.get("type", "").asString() << "\t"
+                  << e.get("size", 0).asUInt64() << "\t" << e.get("status", "").asString() << "\t"
+                  << e.get("path", e.get("name", "")).asString() << "\n";
+    }
+}
+
+void CloudClient::mkdir(const std::string& path) {
+    makeDir(path);
+    std::cout << "mkdir ok\n";
+}
+
+void CloudClient::rm(const std::string& path) {
+    removePath(path);
+    std::cout << "rm ok\n";
+}
+
+void CloudClient::stat(const std::string& path) {
+    std::cout << dumpJson(statPath(path)) << "\n";
+}
+
+void CloudClient::rename(const std::string& from, const std::string& to) {
+    renamePath(from, to);
+    std::cout << "rename ok\n";
 }
 
 }  // namespace cloud
